@@ -116,7 +116,7 @@ export default function App() {
 
   const storeRef = useRef<Store | null>(null);
   const loadedRef = useRef<string | null>(null);  // 记录后端当前加载的 path
-  const appWindow = getCurrentWindow();
+  
 
 
   // ---------- 派生：搜索 + 排序 ----------
@@ -415,7 +415,7 @@ export default function App() {
       ? "列表循环"
       : "单曲循环";
 
-  const isMac = navigator.userAgent.includes("Mac");
+  
 
   return (
     
