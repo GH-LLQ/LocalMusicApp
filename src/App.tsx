@@ -9,6 +9,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
 import { load, type Store } from "@tauri-apps/plugin-store";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import {
   theme,
@@ -115,6 +116,7 @@ export default function App() {
 
   const storeRef = useRef<Store | null>(null);
   const loadedRef = useRef<string | null>(null);  // 记录后端当前加载的 path
+  const appWindow = getCurrentWindow();
 
 
   // ---------- 派生：搜索 + 排序 ----------
@@ -416,6 +418,7 @@ export default function App() {
   const isMac = navigator.userAgent.includes("Mac");
 
   return (
+    
     <div
       style={{
         height: "100%",
@@ -427,29 +430,38 @@ export default function App() {
         overflow: "hidden",
       }}
     >
-      {/* 顶部工具栏（可拖动窗口） */}
+      {/* 顶部拖动条 */}
       <div
+        onMouseDown={() => {
+          
+          getCurrentWindow()
+            .startDragging();
+        }}
+        style={{
+          height: 32,
+          background: theme.colors.panel,
+          
+          flexShrink: 0,
+          cursor: "default",
+        } }
+      />
+
+      {/* 顶部工具栏 */}
+      <div
+        className="titlebar-no-drag"
         style={{
           padding: "10px 16px",
-          paddingLeft: isMac ? 80 : 16,
+          
           borderBottom: `1px solid ${theme.colors.border}`,
           background: theme.colors.panel,
           display: "flex",
           alignItems: "center",
           gap: 10,
           flexWrap: "wrap",
-          WebkitAppRegion: "drag",
-        } as React.CSSProperties}
+          
+        } }
       >
-        <div
-          style={{
-            WebkitAppRegion: "no-drag",
-            display: "flex",
-            alignItems: "center",
-            gap: 10,
-            flex: 1,
-          } as React.CSSProperties}
-        >
+        
           <Button onClick={pickFolder} disabled={loading}>
             {loading ? "扫描中…" : "选择音乐文件夹"}
           </Button>
@@ -488,7 +500,7 @@ export default function App() {
               ? `${displayTracks.length} / ${tracks.length} 首`
               : `共 ${tracks.length} 首`}
           </span>
-        </div>
+        
       </div>
 
       {/* 中间：列表 + 歌词面板 */}
