@@ -114,6 +114,8 @@ export default function App() {
   const lyricsBoxRef = useRef<HTMLDivElement>(null);
 
   const storeRef = useRef<Store | null>(null);
+  const loadedRef = useRef<string | null>(null);  // 记录后端当前加载的 path
+
 
   // ---------- 派生：搜索 + 排序 ----------
   const displayTracks = useMemo(() => {
@@ -197,6 +199,7 @@ export default function App() {
       setCurrent(track);
       setPlaying(true);
       setPosition(0);
+      loadedRef.current = track.path;   // ← 标记后端已加载
     } catch (e) {
       console.error("播放失败", e);
     }
@@ -324,6 +327,14 @@ export default function App() {
 
   async function togglePlay() {
     if (!current) return;
+
+      // 后端还没加载这首歌（比如刚启动、从 store 恢复的），先走 play
+    if (loadedRef.current !== current.path) {
+      await playTrack(current);
+      return;
+    }
+
+
     try {
       if (playing) {
         await invoke("pause");
