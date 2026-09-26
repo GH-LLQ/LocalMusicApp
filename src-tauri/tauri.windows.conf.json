@@ -1,0 +1,14 @@
+{
+    "app": {
+      "windows": [
+        {
+          "title": "LocalMusicApp",
+          "width": 1100,
+          "height": 750,
+          "minWidth": 860,
+          "minHeight": 600,
+          "backgroundColor": "#1e1e1e"
+        }
+      ]
+    }
+  }
