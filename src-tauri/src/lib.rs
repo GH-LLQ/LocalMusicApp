@@ -4,7 +4,7 @@ use lofty::file::{AudioFile, TaggedFileExt};
 use lofty::tag::ItemKey;
 use std::sync::mpsc::{self, Sender};
 use std::thread;
-use rodio::{OutputStream, Sink};
+use rodio::{OutputStream,OutputStreamHandle, Sink};
 use tauri::Manager;
 mod decoder;
 use decoder::SymphoniaSource;
@@ -12,6 +12,7 @@ use std::time::Duration;
 use std::sync::mpsc::RecvTimeoutError;
 use tauri::Emitter;
 use base64::{engine::general_purpose, Engine as _};
+use cpal::traits::{DeviceTrait, HostTrait};
 
 #[derive(Serialize)]
 struct Track {
@@ -196,42 +197,65 @@ pub fn run() {
             let (tx, rx) = mpsc::channel::<AudioCmd>();
         
             thread::spawn(move || {
-                let (_stream, stream_handle) = match OutputStream::try_default() {
-                    Ok(pair) => pair,
-                    Err(e) => {
-                        eprintln!("音频设备初始化失败: {}", e);
-                        return;
+                let host = cpal::default_host();
+
+                // 创建音频输出的辅助函数
+                let create_output = || -> Option<(OutputStream, OutputStreamHandle)> {
+                    match OutputStream::try_default() {
+                        Ok(pair) => Some(pair),
+                        Err(e) => {
+                            eprintln!("音频设备初始化失败: {}", e);
+                            None
+                        }
                     }
                 };
-        
+
+                let device_name = |host: &cpal::Host| -> Option<String> {
+                    host.default_output_device()
+                        .and_then(|d| d.name().ok())
+                };
+
+                let mut output = create_output();
+                let mut current_device = device_name(&host);
+
                 let mut sink: Option<Sink> = None;
                 let mut current_path: Option<String> = None;
                 let mut current_volume: f32 = 1.0;
                 let mut base_offset: f64 = 0.0;
                 let mut ended_reported = false;
-        
+
                 loop {
-                    match rx.recv_timeout(Duration::from_millis(200)) {
+                    match rx.recv_timeout(Duration::from_millis(500)) {
                         Ok(cmd) => match cmd {
                             AudioCmd::Play(path) => {
                                 if let Some(s) = &sink {
                                     s.stop();
                                 }
-                                match SymphoniaSource::open(&path) {
-                                    Ok(source) => match Sink::try_new(&stream_handle) {
-                                        Ok(new_sink) => {
-                                            new_sink.set_volume(current_volume);
-                                            new_sink.append(source);
-                                            new_sink.play();
-                                            sink = Some(new_sink);
-                                            current_path = Some(path);
-                                            base_offset = 0.0;      // ← 新歌，位置归零
-                                        }
-                                        Err(e) => eprintln!("创建 sink 失败: {}", e),
-                                    },
-                                    Err(e) => eprintln!("解码失败 {}: {}", path, e),
+                                sink = None;
+
+                                // 确保有可用的输出设备
+                                if output.is_none() {
+                                    output = create_output();
+                                    current_device = device_name(&host);
                                 }
-                                ended_reported = false;
+
+                                if let Some((_, handle)) = &output {
+                                    match SymphoniaSource::open(&path) {
+                                        Ok(source) => match Sink::try_new(handle) {
+                                            Ok(new_sink) => {
+                                                new_sink.set_volume(current_volume);
+                                                new_sink.append(source);
+                                                new_sink.play();
+                                                sink = Some(new_sink);
+                                                current_path = Some(path);
+                                                base_offset = 0.0;
+                                                ended_reported = false;
+                                            }
+                                            Err(e) => eprintln!("创建 sink 失败: {}", e),
+                                        },
+                                        Err(e) => eprintln!("解码失败 {}: {}", path, e),
+                                    }
+                                }
                             }
                             AudioCmd::Pause => {
                                 if let Some(s) = &sink {
@@ -240,16 +264,19 @@ pub fn run() {
                             }
                             AudioCmd::Resume => {
                                 let is_empty = sink.as_ref().map_or(true, |s| s.empty());
-                            
                                 if is_empty {
-                                    // 已经播完（或没有 sink），重新从当前歌开头播
                                     if let Some(path) = current_path.clone() {
-                                        if let Some(old) = sink.take() {
-                                            old.stop();
+                                        if let Some(s) = &sink {
+                                            s.stop();
                                         }
-                                        match SymphoniaSource::open(&path) {
-                                            Ok(source) => match Sink::try_new(&stream_handle) {
-                                                Ok(new_sink) => {
+                                        sink = None;
+                                        if output.is_none() {
+                                            output = create_output();
+                                            current_device = device_name(&host);
+                                        }
+                                        if let Some((_, handle)) = &output {
+                                            if let Ok(source) = SymphoniaSource::open(&path) {
+                                                if let Ok(new_sink) = Sink::try_new(handle) {
                                                     new_sink.set_volume(current_volume);
                                                     new_sink.append(source);
                                                     new_sink.play();
@@ -257,9 +284,7 @@ pub fn run() {
                                                     base_offset = 0.0;
                                                     ended_reported = false;
                                                 }
-                                                Err(e) => eprintln!("创建 sink 失败: {}", e),
-                                            },
-                                            Err(e) => eprintln!("重开文件失败 {}: {}", path, e),
+                                            }
                                         }
                                     }
                                 } else if let Some(s) = &sink {
@@ -274,41 +299,38 @@ pub fn run() {
                             }
                             AudioCmd::Seek(sec) => {
                                 if let Some(path) = current_path.clone() {
-                                    // 记住当前是否正在播放
                                     let was_playing = sink.as_ref().map_or(false, |s| !s.is_paused());
-                            
-                                    // 停掉旧 sink
                                     if let Some(s) = &sink {
                                         s.stop();
                                     }
-                            
-                                    // 重新打开同一个文件
-                                    match SymphoniaSource::open(&path) {
-                                        Ok(mut source) => {
+                                    sink = None;
+
+                                    if output.is_none() {
+                                        output = create_output();
+                                        current_device = device_name(&host);
+                                    }
+
+                                    if let Some((_, handle)) = &output {
+                                        if let Ok(mut source) = SymphoniaSource::open(&path) {
                                             use rodio::Source;
                                             if let Err(e) = source.try_seek(Duration::from_secs_f64(sec)) {
                                                 eprintln!("seek 失败: {:?}", e);
                                             }
-                            
-                                            match Sink::try_new(&stream_handle) {
-                                                Ok(new_sink) => {
-                                                    new_sink.set_volume(current_volume);
-                                                    new_sink.append(source);
-                                                    if was_playing {
-                                                        new_sink.play();
-                                                    } else {
-                                                        new_sink.pause();
-                                                    }
-                                                    sink = Some(new_sink);
-                                                    base_offset = sec;      // ← 关键：记下目标位置
+                                            if let Ok(new_sink) = Sink::try_new(handle) {
+                                                new_sink.set_volume(current_volume);
+                                                new_sink.append(source);
+                                                if was_playing {
+                                                    new_sink.play();
+                                                } else {
+                                                    new_sink.pause();
                                                 }
-                                                Err(e) => eprintln!("创建 sink 失败: {}", e),
+                                                sink = Some(new_sink);
+                                                base_offset = sec;
+                                                ended_reported = false;
                                             }
                                         }
-                                        Err(e) => eprintln!("重开文件失败 {}: {}", path, e),
                                     }
                                 }
-                                ended_reported = false;
                             }
                             AudioCmd::SetVolume(v) => {
                                 current_volume = v;
@@ -318,9 +340,58 @@ pub fn run() {
                             }
                         },
                         Err(RecvTimeoutError::Timeout) => {
+                            // ===== 检测默认输出设备变化 =====
+                            let new_device = device_name(&host);
+                            if new_device != current_device {
+                                eprintln!("音频设备变化: {:?} -> {:?}", current_device, new_device);
+                                current_device = new_device;
+
+                                // 记录当前状态
+                                let pos = base_offset
+                                    + sink.as_ref().map(|s| s.get_pos().as_secs_f64()).unwrap_or(0.0);
+                                let playing = sink.as_ref().map_or(false, |s| !s.is_paused());
+                                let path = current_path.clone();
+
+                                // 销毁旧流
+                                if let Some(s) = &sink {
+                                    s.stop();
+                                }
+                                sink = None;
+                                output = None;
+
+                                // 重建到新设备
+                                output = create_output();
+                                current_device = device_name(&host);
+
+                                if let (Some((_, handle)), Some(path)) = (&output, path) {
+                                    match SymphoniaSource::open(&path) {
+                                        Ok(mut source) => {
+                                            use rodio::Source;
+                                            let _ = source.try_seek(Duration::from_secs_f64(pos));
+                                            match Sink::try_new(handle) {
+                                                Ok(new_sink) => {
+                                                    new_sink.set_volume(current_volume);
+                                                    new_sink.append(source);
+                                                    if playing {
+                                                        new_sink.play();
+                                                    } else {
+                                                        new_sink.pause();
+                                                    }
+                                                    sink = Some(new_sink);
+                                                    base_offset = pos;
+                                                    ended_reported = false;
+                                                }
+                                                Err(e) => eprintln!("重建 sink 失败: {}", e),
+                                            }
+                                        }
+                                        Err(e) => eprintln!("重开文件失败 {}: {}", path, e),
+                                    }
+                                }
+                            }
+
+                            // ===== 正常进度上报 =====
                             if let Some(s) = &sink {
                                 if s.empty() {
-                                    // 播放结束
                                     if !ended_reported {
                                         ended_reported = true;
                                         let _ = app_handle.emit("playback-ended", ());
@@ -338,7 +409,7 @@ pub fn run() {
                         Err(RecvTimeoutError::Disconnected) => break,
                     }
                 }
-            });
+            }); 
         
             app.manage(AudioPlayer { tx });
             Ok(())
