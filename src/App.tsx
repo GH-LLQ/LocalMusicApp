@@ -207,6 +207,25 @@ export default function App() {
     }
   }, []);
 
+  // 空格快捷键：播放/暂停
+  useEffect(() => {
+    function handleKeyDown(e: KeyboardEvent) {
+      // 焦点在输入框/下拉框里时不拦截（否则空格打不出来）
+      const tag = (e.target as HTMLElement)?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+
+      if (e.code === "Space") {
+        e.preventDefault();   // 阻止页面滚动
+        if (current) {
+          togglePlay();
+        }
+      }
+    }
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [current, playing]);   // 依赖 playing，保证 togglePlay 读到最新状态
+
   // ---------- 监听进度 ----------
   useEffect(() => {
     const unlisten = listen<{ position: number }>("playback-progress", (e) => {
@@ -406,6 +425,8 @@ export default function App() {
   const duration = current?.duration ?? 0;
   const sortValue = sortKey ? `${sortKey}:${sortDir}` : "default";
 
+  const isMac = navigator.userAgent.includes("Mac");
+
   const modeIcon: IconName =
     mode === "sequence" ? "sequence" : mode === "loop" ? "loop" : "single";
   const modeTitle =
@@ -430,21 +451,22 @@ export default function App() {
         overflow: "hidden",
       }}
     >
-      {/* 顶部拖动条 */}
-      <div
-        onMouseDown={() => {
-          
-          getCurrentWindow()
-            .startDragging();
-        }}
-        style={{
-          height: 32,
-          background: theme.colors.panel,
-          
-          flexShrink: 0,
-          cursor: "default",
-        } }
-      />
+      {/* 顶部拖动条（仅 macOS 需要） */}
+      {isMac && (
+        <div
+          onMouseDown={() => {
+            
+            getCurrentWindow().startDragging();
+          }}
+          style={{
+            height: 32,
+            background: theme.colors.panel,
+            flexShrink: 0,
+            cursor: "default",
+          } }
+        />
+      )}
+      
 
       {/* 顶部工具栏 */}
       <div
@@ -518,6 +540,7 @@ export default function App() {
          {displayTracks.map((t) => {
             const isCurrent = current?.path === t.path;
             const isPlayingThis = isCurrent && playing;
+            
 
             return (
               <li

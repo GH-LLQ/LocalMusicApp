@@ -16,11 +16,6 @@
 - 🌓 **深色界面**：统一的设计风格
 - 📦 **体积小**：借助 Tauri，安装包远小于 Electron 应用
 
-## 截图
-
-| 主界面 | 歌词 |
-|---|---|
-| ![main](docs/screenshot-main.png) | ![lyrics](docs/screenshot-lyrics.png) |
 
 ## 下载
 
