@@ -1,18 +1,19 @@
-use serde::Serialize;
-use walkdir::WalkDir;
-use lofty::file::{AudioFile, TaggedFileExt};
-use lofty::tag::ItemKey;
-use std::sync::mpsc::{self, Sender};
-use std::thread;
-use rodio::{OutputStream,OutputStreamHandle, Sink};
-use tauri::Manager;
-mod decoder;
-use decoder::SymphoniaSource;
-use std::time::Duration;
-use std::sync::mpsc::RecvTimeoutError;
-use tauri::Emitter;
 use base64::{engine::general_purpose, Engine as _};
 use cpal::traits::{DeviceTrait, HostTrait};
+use lofty::file::{AudioFile, TaggedFileExt};
+use lofty::tag::ItemKey;
+use rodio::{OutputStream, OutputStreamHandle, Sink};
+use serde::Serialize;
+use souvlaki::{MediaControlEvent, MediaControls, PlatformConfig};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::thread;
+use std::time::Duration;
+use tauri::Emitter;
+use tauri::Manager;
+use walkdir::WalkDir;
+
+mod decoder;
+use decoder::SymphoniaSource;
 
 #[derive(Serialize)]
 struct Track {
@@ -30,8 +31,41 @@ enum AudioCmd {
     Pause,
     Resume,
     Stop,
-    Seek(f64),       // 秒
-    SetVolume(f32),  // 0.0 ~ 1.0
+    Seek(f64),      // 秒
+    SetVolume(f32), // 0.0 ~ 1.0
+}
+
+#[derive(Debug)]
+enum MediaCmd {
+    Update {
+        playing: bool,
+        title: String,
+        artist: String,
+        album: String,
+        duration: Option<Duration>,
+        position: Option<Duration>,
+    },
+}
+
+#[tauri::command]
+fn update_media_state(
+    state: tauri::State<std::sync::Mutex<Sender<MediaCmd>>>,
+    playing: bool,
+    title: String,
+    artist: String,
+    album: String,
+    duration_secs: u64,
+    position_secs: f64,
+) -> Result<(), String> {
+    let _ = state.lock().unwrap().send(MediaCmd::Update {
+        playing,
+        title,
+        artist,
+        album,
+        duration: Some(Duration::from_secs(duration_secs)),
+        position: Some(Duration::from_secs_f64(position_secs)),
+    });
+    Ok(())
 }
 
 #[derive(Serialize, Clone)]
@@ -45,7 +79,10 @@ struct AudioPlayer {
 
 #[tauri::command]
 fn play(state: tauri::State<AudioPlayer>, path: String) -> Result<(), String> {
-    state.tx.send(AudioCmd::Play(path)).map_err(|e| e.to_string())
+    state
+        .tx
+        .send(AudioCmd::Play(path))
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -65,12 +102,18 @@ fn stop(state: tauri::State<AudioPlayer>) -> Result<(), String> {
 
 #[tauri::command]
 fn seek(state: tauri::State<AudioPlayer>, seconds: f64) -> Result<(), String> {
-    state.tx.send(AudioCmd::Seek(seconds)).map_err(|e| e.to_string())
+    state
+        .tx
+        .send(AudioCmd::Seek(seconds))
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 fn set_volume(state: tauri::State<AudioPlayer>, volume: f32) -> Result<(), String> {
-    state.tx.send(AudioCmd::SetVolume(volume)).map_err(|e| e.to_string())
+    state
+        .tx
+        .send(AudioCmd::SetVolume(volume))
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -82,10 +125,7 @@ fn get_cover(path: String) -> Result<Option<String>, String> {
 
     for tag in tagged.tags() {
         if let Some(pic) = tag.pictures().first() {
-            let mime = pic
-                .mime_type()
-                .map(|m| m.as_str())
-                .unwrap_or("image/jpeg");
+            let mime = pic.mime_type().map(|m| m.as_str()).unwrap_or("image/jpeg");
             let b64 = general_purpose::STANDARD.encode(pic.data());
             return Ok(Some(format!("data:{};base64,{}", mime, b64)));
         }
@@ -183,9 +223,7 @@ fn scan_music_dir(dir: String) -> Result<Vec<Track>, String> {
     }
     eprintln!("扫描到 {} 首歌", tracks.len());
     Ok(tracks)
-    
 }
-
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -193,13 +231,108 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_store::Builder::new().build())
         .setup(|app| {
+            // ====== 初始化蓝牙/系统媒体控制 ======
+            #[cfg(target_os = "windows")]
+            let hwnd_val = {
+                let window = app.get_webview_window("main").unwrap();
+                window.hwnd().unwrap().0 as usize
+            };
+            #[cfg(not(target_os = "windows"))]
+            let _hwnd_val = 0usize;
+
+            #[cfg(target_os = "windows")]
+            let hwnd = if hwnd_val != 0 {
+                Some(hwnd_val as *mut std::ffi::c_void)
+            } else {
+                None
+            };
+            #[cfg(not(target_os = "windows"))]
+            let hwnd = None;
+
+            let config = PlatformConfig {
+                dbus_name: "muse",
+                display_name: "Muse",
+                hwnd,
+            };
+
+            let (media_tx, media_rx) = mpsc::channel::<MediaCmd>();
+            app.manage(std::sync::Mutex::new(media_tx));
+
+            // 【关键】在主线程初始化 MediaControls
+            match MediaControls::new(config) {
+                Ok(mut controls) => {
+                    println!("系统媒体控制初始化成功");
+                    let app_handle_media = app.handle().clone();
+
+                    if let Err(e) = controls.attach(move |event| {
+                        eprintln!("[Souvlaki] 收到系统媒体事件: {:?}", event);
+                        match event {
+                            MediaControlEvent::Toggle | MediaControlEvent::Play => {
+                                let _ = app_handle_media.emit("hw-media-play", ());
+                            }
+                            MediaControlEvent::Pause => {
+                                let _ = app_handle_media.emit("hw-media-pause", ());
+                            }
+                            MediaControlEvent::Next => {
+                                let _ = app_handle_media.emit("hw-media-next", ());
+                            }
+                            MediaControlEvent::Previous => {
+                                let _ = app_handle_media.emit("hw-media-prev", ());
+                            }
+                            _ => {}
+                        }
+                    }) {
+                        eprintln!("媒体按键绑定失败: {:?}", e);
+                    }
+
+                    // 移交给后台线程处理状态更新
+                    std::thread::spawn(move || {
+                        while let Ok(cmd) = media_rx.recv() {
+                            match cmd {
+                                MediaCmd::Update {
+                                    playing,
+                                    title,
+                                    artist,
+                                    album,
+                                    duration,
+                                    position,
+                                } => {
+                                    let metadata = souvlaki::MediaMetadata {
+                                        title: Some(&title),
+                                        artist: Some(&artist),
+                                        album: Some(&album),
+                                        duration,
+                                        cover_url: None,
+                                    };
+                                    let _ = controls.set_metadata(metadata);
+
+                                    let playback = if playing {
+                                        souvlaki::MediaPlayback::Playing {
+                                            progress: position.map(souvlaki::MediaPosition),
+                                        }
+                                    } else {
+                                        souvlaki::MediaPlayback::Paused {
+                                            progress: position.map(souvlaki::MediaPosition),
+                                        }
+                                    };
+                                    let _ = controls.set_playback(playback);
+                                }
+                            }
+                        }
+                    });
+                }
+                Err(e) => {
+                    eprintln!("系统媒体控制初始化失败: {:?}", e);
+                }
+            }
+
+            // ====== 音频播放线程 ======
             let app_handle = app.handle().clone();
             let (tx, rx) = mpsc::channel::<AudioCmd>();
-        
+
             thread::spawn(move || {
                 let host = cpal::default_host();
 
-                // 创建音频输出的辅助函数
                 let create_output = || -> Option<(OutputStream, OutputStreamHandle)> {
                     match OutputStream::try_default() {
                         Ok(pair) => Some(pair),
@@ -211,8 +344,7 @@ pub fn run() {
                 };
 
                 let device_name = |host: &cpal::Host| -> Option<String> {
-                    host.default_output_device()
-                        .and_then(|d| d.name().ok())
+                    host.default_output_device().and_then(|d| d.name().ok())
                 };
 
                 let mut output = create_output();
@@ -233,7 +365,6 @@ pub fn run() {
                                 }
                                 sink = None;
 
-                                // 确保有可用的输出设备
                                 if output.is_none() {
                                     output = create_output();
                                     current_device = device_name(&host);
@@ -299,7 +430,8 @@ pub fn run() {
                             }
                             AudioCmd::Seek(sec) => {
                                 if let Some(path) = current_path.clone() {
-                                    let was_playing = sink.as_ref().map_or(false, |s| !s.is_paused());
+                                    let was_playing =
+                                        sink.as_ref().map_or(false, |s| !s.is_paused());
                                     if let Some(s) = &sink {
                                         s.stop();
                                     }
@@ -313,7 +445,9 @@ pub fn run() {
                                     if let Some((_, handle)) = &output {
                                         if let Ok(mut source) = SymphoniaSource::open(&path) {
                                             use rodio::Source;
-                                            if let Err(e) = source.try_seek(Duration::from_secs_f64(sec)) {
+                                            if let Err(e) =
+                                                source.try_seek(Duration::from_secs_f64(sec))
+                                            {
                                                 eprintln!("seek 失败: {:?}", e);
                                             }
                                             if let Ok(new_sink) = Sink::try_new(handle) {
@@ -340,26 +474,26 @@ pub fn run() {
                             }
                         },
                         Err(RecvTimeoutError::Timeout) => {
-                            // ===== 检测默认输出设备变化 =====
+                            // 检测设备变化
                             let new_device = device_name(&host);
                             if new_device != current_device {
                                 eprintln!("音频设备变化: {:?} -> {:?}", current_device, new_device);
-                                current_device = new_device;
+                                
 
-                                // 记录当前状态
                                 let pos = base_offset
-                                    + sink.as_ref().map(|s| s.get_pos().as_secs_f64()).unwrap_or(0.0);
+                                    + sink
+                                        .as_ref()
+                                        .map(|s| s.get_pos().as_secs_f64())
+                                        .unwrap_or(0.0);
                                 let playing = sink.as_ref().map_or(false, |s| !s.is_paused());
                                 let path = current_path.clone();
 
-                                // 销毁旧流
                                 if let Some(s) = &sink {
                                     s.stop();
                                 }
                                 sink = None;
-                                output = None;
+                                
 
-                                // 重建到新设备
                                 output = create_output();
                                 current_device = device_name(&host);
 
@@ -389,7 +523,7 @@ pub fn run() {
                                 }
                             }
 
-                            // ===== 正常进度上报 =====
+                            // 进度上报
                             if let Some(s) = &sink {
                                 if s.empty() {
                                     if !ended_reported {
@@ -399,18 +533,16 @@ pub fn run() {
                                 } else {
                                     ended_reported = false;
                                     let position = base_offset + s.get_pos().as_secs_f64();
-                                    let _ = app_handle.emit(
-                                        "playback-progress",
-                                        PlaybackProgress { position },
-                                    );
+                                    let _ = app_handle
+                                        .emit("playback-progress", PlaybackProgress { position });
                                 }
                             }
                         }
                         Err(RecvTimeoutError::Disconnected) => break,
                     }
                 }
-            }); 
-        
+            });
+
             app.manage(AudioPlayer { tx });
             Ok(())
         })
@@ -423,7 +555,8 @@ pub fn run() {
             seek,
             set_volume,
             get_cover,
-            get_lyrics
+            get_lyrics,
+            update_media_state
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

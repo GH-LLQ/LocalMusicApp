@@ -115,9 +115,7 @@ export default function App() {
   const lyricsBoxRef = useRef<HTMLDivElement>(null);
 
   const storeRef = useRef<Store | null>(null);
-  const loadedRef = useRef<string | null>(null);  // 记录后端当前加载的 path
-  
-
+  const loadedRef = useRef<string | null>(null);
 
   // ---------- 派生：搜索 + 排序 ----------
   const displayTracks = useMemo(() => {
@@ -154,10 +152,11 @@ export default function App() {
     current: null as Track | null,
     volume: 0.8,
     mode: "sequence" as PlayMode,
+    playing: false,
   });
   useEffect(() => {
-    stateRef.current = { tracks: displayTracks, current, volume, mode };
-  }, [displayTracks, current, volume, mode]);
+    stateRef.current = { tracks: displayTracks, current, volume, mode, playing };
+  }, [displayTracks, current, volume, mode, playing]);
 
   // ---------- 启动时恢复设置 ----------
   useEffect(() => {
@@ -201,21 +200,20 @@ export default function App() {
       setCurrent(track);
       setPlaying(true);
       setPosition(0);
-      loadedRef.current = track.path;   // ← 标记后端已加载
+      loadedRef.current = track.path;
     } catch (e) {
       console.error("播放失败", e);
     }
   }, []);
 
-  // 空格快捷键：播放/暂停
+  // 空格快捷键
   useEffect(() => {
     function handleKeyDown(e: KeyboardEvent) {
-      // 焦点在输入框/下拉框里时不拦截（否则空格打不出来）
       const tag = (e.target as HTMLElement)?.tagName;
       if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
 
       if (e.code === "Space") {
-        e.preventDefault();   // 阻止页面滚动
+        e.preventDefault();
         if (current) {
           togglePlay();
         }
@@ -224,7 +222,7 @@ export default function App() {
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [current, playing]);   // 依赖 playing，保证 togglePlay 读到最新状态
+  }, [current, playing]);
 
   // ---------- 监听进度 ----------
   useEffect(() => {
@@ -325,8 +323,58 @@ export default function App() {
     }
   }, [lyricLine]);
 
-  // ---------- 操作函数 ----------
+  // ---------- 向系统同步媒体状态（包含进度） ----------
+  useEffect(() => {
+    if (current) {
+      invoke("update_media_state", {
+        playing,
+        title: current.title,
+        artist: current.artist,
+        album: current.album,
+        durationSecs: current.duration,
+        positionSecs: position,
+      }).catch(console.error);
+    } else {
+      invoke("update_media_state", {
+        playing: false,
+        title: "",
+        artist: "",
+        album: "",
+        durationSecs: 0,
+        positionSecs: 0,
+      }).catch(console.error);
+    }
+  }, [current, playing, Math.floor(position)]);
 
+  // ---------- 监听系统/蓝牙媒体按键 ----------
+  useEffect(() => {
+    const unlisteners = [
+      listen("hw-media-play", async() => {
+        if (stateRef.current.current && !stateRef.current.playing) {
+          await invoke("resume");
+          setPlaying(true);
+        }
+      }),
+      listen("hw-media-pause", async () => {
+        if (stateRef.current.current && stateRef.current.playing) {
+          await invoke("pause");
+          setPlaying(false);
+        }
+      }),
+      listen("hw-media-next", () => {
+        handleNext();
+      }),
+      listen("hw-media-prev", () => {
+        handlePrev();
+      }),
+    ];
+
+    return () => {
+      unlisteners.forEach((p) => p.then((f) => f()));
+    };
+  }, []);
+
+  // ---------- 操作函数 ----------
   async function pickFolder() {
     const dir = await open({ directory: true });
     if (typeof dir !== "string") return;
@@ -349,12 +397,10 @@ export default function App() {
   async function togglePlay() {
     if (!current) return;
 
-      // 后端还没加载这首歌（比如刚启动、从 store 恢复的），先走 play
     if (loadedRef.current !== current.path) {
       await playTrack(current);
       return;
     }
-
 
     try {
       if (playing) {
@@ -382,11 +428,11 @@ export default function App() {
   }
 
   function handleRowButtonClick(e: React.MouseEvent, track: Track) {
-    e.stopPropagation();   // 阻止冒泡，避免触发行的 onDoubleClick
+    e.stopPropagation();
     if (current?.path === track.path) {
-      togglePlay();        // 当前曲目 → 暂停/继续
+      togglePlay();
     } else {
-      playTrack(track);    // 其他曲目 → 播放
+      playTrack(track);
     }
   }
 
@@ -421,10 +467,8 @@ export default function App() {
   }
 
   // ---------- 渲染 ----------
-
   const duration = current?.duration ?? 0;
   const sortValue = sortKey ? `${sortKey}:${sortDir}` : "default";
-
   const isMac = navigator.userAgent.includes("Mac");
 
   const modeIcon: IconName =
@@ -436,10 +480,7 @@ export default function App() {
       ? "列表循环"
       : "单曲循环";
 
-  
-
   return (
-    
     <div
       style={{
         height: "100%",
@@ -455,7 +496,6 @@ export default function App() {
       {isMac && (
         <div
           onMouseDown={() => {
-            
             getCurrentWindow().startDragging();
           }}
           style={{
@@ -463,66 +503,61 @@ export default function App() {
             background: theme.colors.panel,
             flexShrink: 0,
             cursor: "default",
-          } }
+          }}
         />
       )}
-      
 
       {/* 顶部工具栏 */}
       <div
         className="titlebar-no-drag"
         style={{
           padding: "10px 16px",
-          
           borderBottom: `1px solid ${theme.colors.border}`,
           background: theme.colors.panel,
           display: "flex",
           alignItems: "center",
           gap: 10,
           flexWrap: "wrap",
-          
-        } }
+        }}
       >
-        
-          <Button onClick={pickFolder} disabled={loading}>
-            {loading ? "扫描中…" : "选择音乐文件夹"}
-          </Button>
+        <Button onClick={pickFolder} disabled={loading}>
+          {loading ? "扫描中…" : "选择音乐文件夹"}
+        </Button>
 
-          <TextInput
-            value={query}
-            onChange={setQuery}
-            placeholder="搜索标题 / 艺术家 / 专辑…"
-            style={{ flex: 1, minWidth: 180 }}
-          />
+        <TextInput
+          value={query}
+          onChange={setQuery}
+          placeholder="搜索标题 / 艺术家 / 专辑…"
+          style={{ flex: 1, minWidth: 180 }}
+        />
 
-          <Select
-            value={sortValue}
-            onChange={handleSortChange}
-            options={[
-              { value: "default", label: "默认顺序" },
-              { value: "title:asc", label: "标题 A→Z" },
-              { value: "title:desc", label: "标题 Z→A" },
-              { value: "artist:asc", label: "艺术家 A→Z" },
-              { value: "artist:desc", label: "艺术家 Z→A" },
-              { value: "album:asc", label: "专辑 A→Z" },
-              { value: "album:desc", label: "专辑 Z→A" },
-              { value: "duration:asc", label: "时长 短→长" },
-              { value: "duration:desc", label: "时长 长→短" },
-            ]}
-          />
+        <Select
+          value={sortValue}
+          onChange={handleSortChange}
+          options={[
+            { value: "default", label: "默认顺序" },
+            { value: "title:asc", label: "标题 A→Z" },
+            { value: "title:desc", label: "标题 Z→A" },
+            { value: "artist:asc", label: "艺术家 A→Z" },
+            { value: "artist:desc", label: "艺术家 Z→A" },
+            { value: "album:asc", label: "专辑 A→Z" },
+            { value: "album:desc", label: "专辑 Z→A" },
+            { value: "duration:asc", label: "时长 短→长" },
+            { value: "duration:desc", label: "时长 长→短" },
+          ]}
+        />
 
-          <span
-            style={{
-              color: theme.colors.textDim,
-              fontSize: 13,
-              whiteSpace: "nowrap",
-            }}
-          >
-            {query
-              ? `${displayTracks.length} / ${tracks.length} 首`
-              : `共 ${tracks.length} 首`}
-          </span>
-        
+        <span
+          style={{
+            color: theme.colors.textDim,
+            fontSize: 13,
+            whiteSpace: "nowrap",
+          }}
+        >
+          {query
+            ? `${displayTracks.length} / ${tracks.length} 首`
+            : `共 ${tracks.length} 首`}
+        </span>
       </div>
 
       {/* 中间：列表 + 歌词面板 */}
@@ -537,10 +572,9 @@ export default function App() {
             overflowY: "auto",
           }}
         >
-         {displayTracks.map((t) => {
+          {displayTracks.map((t) => {
             const isCurrent = current?.path === t.path;
             const isPlayingThis = isCurrent && playing;
-            
 
             return (
               <li
@@ -548,7 +582,6 @@ export default function App() {
                 className={`track-row${isCurrent ? " is-current" : ""}`}
                 onDoubleClick={() => playTrack(t)}
               >
-                {/* 左侧播放按钮（占固定宽度，hover 时出现） */}
                 <button
                   className="track-play-btn"
                   onClick={(e) => handleRowButtonClick(e, t)}
@@ -557,7 +590,6 @@ export default function App() {
                   <Icon name={isPlayingThis ? "pause" : "play"} size={16} />
                 </button>
 
-                {/* 歌曲信息 */}
                 <span
                   style={{
                     flex: 1,
@@ -579,7 +611,6 @@ export default function App() {
                   )}
                 </span>
 
-                {/* 时长 */}
                 <span
                   style={{
                     color: theme.colors.textDim,
@@ -691,7 +722,6 @@ export default function App() {
 
         {/* 控制行 */}
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          {/* 封面 */}
           <div
             style={{
               width: 56,

@@ -1,3 +1,4 @@
+use rodio::Source;
 use std::fs::File;
 use std::time::Duration;
 use symphonia::core::audio::{AudioBufferRef, Signal};
@@ -7,9 +8,7 @@ use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
-use rodio::Source;
 use symphonia::core::units::Time;
-
 
 pub struct SymphoniaSource {
     format: Box<dyn FormatReader>,
@@ -149,8 +148,6 @@ impl SymphoniaSource {
             }
         }
     }
-
-    
 }
 
 impl Iterator for SymphoniaSource {
@@ -196,7 +193,7 @@ impl Source for SymphoniaSource {
             seconds: total.floor() as u64,
             frac: total.fract(),
         };
-    
+
         self.format
             .seek(
                 SeekMode::Accurate,
@@ -211,11 +208,11 @@ impl Source for SymphoniaSource {
                     underlying_source: "SymphoniaSource",
                 }
             })?;
-    
+
         self.decoder.reset();
         self.buffer.clear();
         self.buffer_pos = 0;
-    
+
         Ok(())
     }
 }
